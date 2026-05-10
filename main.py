@@ -17,6 +17,7 @@ import regimes as regmod
 import strategies as strats
 import backtester
 import optimizer
+import sf_client as sf
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -66,19 +67,40 @@ def get_strategies():
 
 @app.get("/regimes/current")
 def get_current_regime(symbol: str = "BTC/USDT:USDT"):
-    df = datamod.fetch_ohlcv(symbol, "1d", since_days=120)
+    """Current regime label with full per-indicator breakdown."""
+    df = datamod.fetch_ohlcv(symbol, "1d", since_days=400)
     if df.empty:
         raise HTTPException(status_code=503, detail="Could not fetch data")
-    return {"symbol": symbol, "regime": regmod.current_regime(df)}
+    return {"symbol": symbol, **regmod.current_regime_detail(df)}
 
 
 @app.get("/regimes/history")
 def get_regime_history(symbol: str = "BTC/USDT:USDT", days: int = 365):
-    df = datamod.fetch_ohlcv(symbol, "1d", since_days=days)
+    """Daily regime label for the last N days."""
+    df = datamod.fetch_ohlcv(symbol, "1d", since_days=days + 250)
     if df.empty:
         raise HTTPException(status_code=503, detail="Could not fetch data")
     history = regmod.regime_history(df)
-    return {"symbol": symbol, "history": history}
+    return {"symbol": symbol, "history": history[-days:]}
+
+
+@app.get("/regimes/breakdown")
+def get_regime_breakdown(symbol: str = "BTC/USDT:USDT", days: int = 180):
+    """Daily regime with per-indicator scores — for charting component contributions."""
+    df = datamod.fetch_ohlcv(symbol, "1d", since_days=days + 250)
+    if df.empty:
+        raise HTTPException(status_code=503, detail="Could not fetch data")
+    rows = regmod.regime_history_with_scores(df, tail=days)
+    return {"symbol": symbol, "rows": rows}
+
+
+@app.get("/regimes/transitions")
+def get_regime_transitions(symbol: str = "BTC/USDT:USDT", days: int = 730):
+    """Only the dates where regime changed label — useful for annotating charts."""
+    df = datamod.fetch_ohlcv(symbol, "1d", since_days=days + 250)
+    if df.empty:
+        raise HTTPException(status_code=503, detail="Could not fetch data")
+    return {"symbol": symbol, "transitions": regmod.regime_transitions(df)}
 
 
 # ── backtests ────────────────────────────────────────────────────────────────────
@@ -215,11 +237,9 @@ def scenario(req: ScenarioRequest):
             continue
         r = job["result"]
         trades = r.get("trades", [])
-        # use avg_trade_pct / avg days held as a proxy daily rate
         if not trades:
             continue
         avg_pct = r.get("avg_trade_pct", 0)
-        # rough projection: compound avg trade return over `days`
         projected = round((1 + avg_pct / 100) ** req.days * 100 - 100, 2)
         output.append({
             "strategy": r["strategy"],
@@ -229,3 +249,394 @@ def scenario(req: ScenarioRequest):
             "projected_return_pct": projected,
         })
     return output
+
+
+# ── StrategyFactory analysis ──────────────────────────────────────────────────
+
+_sf_client = sf.SFClient()
+
+# simple in-process cache (TTL 5 min)
+import time as _time
+_sf_cache: dict = {}
+_SF_TTL = 300
+
+
+def _sf_cached(key: str, fn):
+    entry = _sf_cache.get(key)
+    if entry and (_time.time() - entry["ts"]) < _SF_TTL:
+        return entry["data"]
+    data = fn()
+    _sf_cache[key] = {"ts": _time.time(), "data": data}
+    return data
+
+
+def _fetch_pool() -> list:
+    raw = _sf_client.get("/api/user-api/strategies")
+    return raw.get("items", []) if isinstance(raw, dict) else raw
+
+
+def _fetch_bots() -> list:
+    raw = _sf_client.get("/api/user-api/bots")
+    return raw.get("items", []) if isinstance(raw, dict) else raw
+
+
+def _fetch_strategy_detail(sid: str) -> dict:
+    try:
+        d = _sf_client.get(f"/api/user-api/strategies/{sid}")
+        s = d.get("strategy", d)
+        return {
+            "raw": s,
+            "m":   sf.extract_metrics(s),
+            "dm":  sf.extract_detail_metrics(s),
+            "name": s.get("name", sid),
+        }
+    except Exception:
+        return {}
+
+
+@app.get("/sf/regime")
+def sf_regime():
+    """Current market regime from the full SF strategy pool."""
+    if not sf.SF_KEY:
+        raise HTTPException(status_code=503, detail="SF_KEY not configured")
+    try:
+        pool = _sf_cached("pool", _fetch_pool)
+        return sf.detect_regime(pool)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/sf/strategies")
+def sf_strategies(limit: int = 50):
+    """Full SF strategy pool, scored and sorted."""
+    if not sf.SF_KEY:
+        raise HTTPException(status_code=503, detail="SF_KEY not configured")
+    try:
+        pool = _sf_cached("pool", _fetch_pool)
+        result = []
+        for s in pool:
+            m = sf.extract_metrics(s)
+            result.append({
+                "id":          s.get("id") or s.get("slug"),
+                "name":        s.get("name") or s.get("slug", ""),
+                "slug":        s.get("slug", ""),
+                "type":        sf.detect_type(s),
+                "pair":        s.get("pair", ""),
+                "timeframe":   s.get("timeframe", ""),
+                "score":       sf.compute_score(m),
+                "metrics": {
+                    "sharpe_live":  m["sharpe_live"],
+                    "sharpe_bt":    m["sharpe_bt"],
+                    "dd":           m["dd"],
+                    "wr_live":      m["wr_live"],
+                    "pf":           m["pf"],
+                    "trades_live":  m["trades_live"],
+                    "pnl":          m["pnl"],
+                    "sortino":      m["sortino"],
+                    "lbt_ratio":    round(m["sharpe_live"] / m["sharpe_bt"], 3) if m["sharpe_bt"] > 0 else 0,
+                },
+            })
+        result.sort(key=lambda x: x["score"], reverse=True)
+        return result[:limit]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/sf/bots")
+def sf_bots():
+    """Active bots with lifecycle verdicts (hold / warn / pause)."""
+    if not sf.SF_KEY:
+        raise HTTPException(status_code=503, detail="SF_KEY not configured")
+    try:
+        pool  = _sf_cached("pool", _fetch_pool)
+        bots  = _sf_cached("bots", _fetch_bots)
+        regime = sf.detect_regime(pool)
+
+        result = []
+        for bot in bots:
+            sid    = bot.get("strategyId") or bot.get("strategySlug")
+            detail = _sf_cached(f"detail:{sid}", lambda s=sid: _fetch_strategy_detail(s))
+            m  = detail.get("m", {})
+            dm = detail.get("dm", {})
+
+            if not m:
+                result.append({
+                    "bot_id":   bot.get("id"),
+                    "name":     bot.get("name", sid),
+                    "status":   bot.get("status", "UNKNOWN"),
+                    "strategy_id": sid,
+                    "strategy_slug": bot.get("strategySlug", ""),
+                    "verdict":  "UNKNOWN",
+                    "flags":    [],
+                    "action":   "No strategy data",
+                    "metrics":  {},
+                })
+                continue
+
+            lc  = sf.lifecycle_verdict(m, dm, regime)
+            lbt = (m["sharpe_live"] / m["sharpe_bt"]) if m.get("sharpe_bt", 0) > 0 else 0
+
+            result.append({
+                "bot_id":        bot.get("id"),
+                "name":          bot.get("name", sid),
+                "status":        bot.get("status", "ACTIVE"),
+                "strategy_id":   sid,
+                "strategy_slug": bot.get("strategySlug", ""),
+                "amount":        bot.get("amount", 0),
+                "verdict":       lc["verdict"],
+                "flags":         lc["flags"],
+                "action":        lc["action"],
+                "lbt_ratio":     round(lbt, 3),
+                "metrics": {
+                    "pct7":        dm.get("pct7", 0),
+                    "pct30":       dm.get("pct30", 0),
+                    "pct90":       dm.get("pct90", 0),
+                    "sharpe_live": m.get("sharpe_live", 0),
+                    "dd":          m.get("dd", 0),
+                    "wr_live":     m.get("wr_live", 0),
+                    "pf":          m.get("pf", 0),
+                    "trades_live": m.get("trades_live", 0),
+                },
+            })
+
+        return {"regime": regime, "bots": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/sf/recommendations")
+def sf_recommendations(top_candidates: int = 5):
+    """
+    The main decision endpoint.
+    Returns:
+      - Current regime
+      - For each active bot: HOLD / WARN / PAUSE + reason
+      - Top strategies to ADD from the pool (passed all gates)
+      - A priority-ordered action list for the user
+    """
+    if not sf.SF_KEY:
+        raise HTTPException(status_code=503, detail="SF_KEY not configured")
+    try:
+        pool   = _sf_cached("pool", _fetch_pool)
+        bots   = _sf_cached("bots", _fetch_bots)
+        regime = sf.detect_regime(pool)
+
+        # ── lifecycle per active bot ──────────────────────────────────────────
+        existing_ids   = set()
+        existing_types = []
+        bot_verdicts   = []
+        actions        = []
+
+        for bot in bots:
+            sid    = bot.get("strategyId") or bot.get("strategySlug")
+            existing_ids.add(sid)
+            detail = _sf_cached(f"detail:{sid}", lambda s=sid: _fetch_strategy_detail(s))
+            m      = detail.get("m", {})
+            dm     = detail.get("dm", {})
+
+            if not m:
+                continue
+
+            existing_types.append(sf.detect_type(detail.get("raw", {})))
+            lc   = sf.lifecycle_verdict(m, dm, regime)
+            lbt  = (m["sharpe_live"] / m["sharpe_bt"]) if m.get("sharpe_bt", 0) > 0 else 0
+            entry = {
+                "bot_id":        bot.get("id"),
+                "name":          bot.get("name", sid),
+                "strategy_slug": bot.get("strategySlug", ""),
+                "verdict":       lc["verdict"],
+                "action":        lc["action"],
+                "flags":         lc["flags"],
+                "lbt_ratio":     round(lbt, 3),
+                "metrics": {
+                    "pct7":        dm.get("pct7", 0),
+                    "pct30":       dm.get("pct30", 0),
+                    "sharpe_live": m.get("sharpe_live", 0),
+                    "dd":          m.get("dd", 0),
+                },
+            }
+            bot_verdicts.append(entry)
+
+            if lc["verdict"] in ("PAUSE", "WARN"):
+                priority = 1 if lc["verdict"] == "PAUSE" else 2
+                actions.append({
+                    "priority":  priority,
+                    "type":      lc["verdict"],
+                    "target":    bot.get("name", sid),
+                    "bot_id":    bot.get("id"),
+                    "action":    lc["action"],
+                    "reason":    "; ".join(lc["flags"][:2]),
+                })
+
+        # ── add candidates ───────────────────────────────────────────────────
+        candidates = sf.find_add_candidates(
+            pool, existing_ids, existing_types, regime, top_n=top_candidates
+        )
+        for c in candidates:
+            actions.append({
+                "priority": 3,
+                "type":     "ADD",
+                "target":   c["name"],
+                "bot_id":   None,
+                "action":   f"Add strategy — score {c['score']}/100",
+                "reason":   f"Sharpe {c['metrics']['sharpe_live']:.2f}, DD {c['metrics']['dd']:.1f}%, WR {c['metrics']['wr_live']:.0f}%",
+            })
+
+        # ── regime-level circuit breaker ─────────────────────────────────────
+        if regime["label"] == "STRESS":
+            actions.insert(0, {
+                "priority": 0,
+                "type":     "CIRCUIT_BREAKER",
+                "target":   "ALL",
+                "bot_id":   None,
+                "action":   "Consider pausing all bots — market in STRESS",
+                "reason":   regime["desc"],
+            })
+
+        actions.sort(key=lambda a: a["priority"])
+
+        return {
+            "as_of":       datetime.now(timezone.utc).isoformat(),
+            "regime":      regime,
+            "bots":        bot_verdicts,
+            "candidates":  candidates,
+            "actions":     actions,
+            "summary": {
+                "total_bots":    len(bot_verdicts),
+                "hold":          sum(1 for b in bot_verdicts if b["verdict"] == "HOLD"),
+                "warn":          sum(1 for b in bot_verdicts if b["verdict"] == "WARN"),
+                "pause":         sum(1 for b in bot_verdicts if b["verdict"] == "PAUSE"),
+                "add_candidates": len(candidates),
+            },
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/sf/rotation")
+def sf_rotation():
+    """
+    Portfolio rotation analysis — the decay/diversification endpoint.
+
+    Addresses two recurring problems:
+      1. Good strategies decay — this endpoint detects decay early via a composite
+         health score (Sharpe live, LBT ratio, 30d/7d returns) and zones each bot
+         CORE / WATCH / ROTATE.
+      2. Portfolio too small/concentrated — checks against the 8-12 target range
+         and flags type over-concentration.
+
+    Returns specific swap recommendations: which bot to drop and what to add instead.
+    """
+    if not sf.SF_KEY:
+        raise HTTPException(status_code=503, detail="SF_KEY not configured")
+    try:
+        from rotation import (
+            _decay_score, _classify_zone, TARGET_MIN, TARGET_MAX, MAX_PER_TYPE,
+            _diversity_recommendation,
+        )
+
+        pool   = _sf_cached("pool", _fetch_pool)
+        bots   = _sf_cached("bots", _fetch_bots)
+        regime = sf.detect_regime(pool)
+
+        # fetch detail for every bot
+        existing_ids   = set()
+        existing_types = []
+        bot_health     = []
+
+        for bot in bots:
+            sid    = bot.get("strategyId") or bot.get("strategySlug")
+            existing_ids.add(sid)
+            detail = _sf_cached(f"detail:{sid}", lambda s=sid: _fetch_strategy_detail(s))
+            m      = detail.get("m", {})
+            dm     = detail.get("dm", {})
+            raw_s  = detail.get("raw", {})
+
+            if not m:
+                continue
+
+            existing_types.append(sf.detect_type(raw_s))
+            lc     = sf.lifecycle_verdict(m, dm, regime)
+            lbt    = m["sharpe_live"] / m["sharpe_bt"] if m.get("sharpe_bt", 0) > 0 else 0
+            decay  = _decay_score(m, dm)
+            zone   = _classify_zone(lc["verdict"], decay)
+
+            bot_health.append({
+                "bot_id":        bot.get("id"),
+                "name":          bot.get("name", sid),
+                "strategy_slug": bot.get("strategySlug", ""),
+                "verdict":       lc["verdict"],
+                "zone":          zone,
+                "decay_score":   decay,
+                "lbt_ratio":     round(lbt, 3),
+                "metrics": {
+                    "pct7":        dm.get("pct7", 0),
+                    "pct30":       dm.get("pct30", 0),
+                    "sharpe_live": m.get("sharpe_live", 0),
+                    "dd":          m.get("dd", 0),
+                    "wr_live":     m.get("wr_live", 0),
+                    "trades_live": m.get("trades_live", 0),
+                },
+                "flags":  lc["flags"],
+                "action": lc["action"],
+            })
+
+        # find replacements for ROTATE bots
+        candidates = sf.find_add_candidates(pool, existing_ids, existing_types, regime, top_n=20)
+
+        rotate_out = sorted(
+            [b for b in bot_health if b["zone"] == "ROTATE"],
+            key=lambda b: b["decay_score"]
+        )
+        swaps = []
+        for i, drop in enumerate(rotate_out):
+            replacement = candidates[i] if i < len(candidates) else None
+            swaps.append({
+                "drop": {
+                    "name":        drop["name"],
+                    "bot_id":      drop["bot_id"],
+                    "decay_score": drop["decay_score"],
+                    "zone":        drop["zone"],
+                    "reason":      "; ".join(drop["flags"][:2]) or drop["action"],
+                },
+                "add": {
+                    "name":    replacement["name"],
+                    "id":      replacement["id"],
+                    "score":   replacement["score"],
+                    "metrics": replacement["metrics"],
+                } if replacement else None,
+            })
+
+        # diversity report
+        n = len(bot_health)
+        type_counts: dict[str, int] = {}
+        for b in bot_health:
+            t = sf.detect_type({"slug": b["strategy_slug"]})
+            type_counts[t] = type_counts.get(t, 0) + 1
+
+        size_verdict = "OK" if TARGET_MIN <= n <= TARGET_MAX else ("TOO_FEW" if n < TARGET_MIN else "TOO_MANY")
+        concentrated = {t: c for t, c in type_counts.items() if c > MAX_PER_TYPE}
+
+        return {
+            "as_of":   datetime.now(timezone.utc).isoformat(),
+            "regime":  regime,
+            "bots":    sorted(bot_health, key=lambda b: b["decay_score"]),
+            "swaps":   swaps,
+            "diversity": {
+                "active_count":    n,
+                "target_range":    f"{TARGET_MIN}-{TARGET_MAX}",
+                "size_verdict":    size_verdict,
+                "type_distribution": type_counts,
+                "concentrated_types": concentrated,
+                "recommendation":  _diversity_recommendation(n, size_verdict, concentrated, candidates),
+            },
+            "candidates_pool": candidates[:10],
+            "summary": {
+                "core":   sum(1 for b in bot_health if b["zone"] == "CORE"),
+                "watch":  sum(1 for b in bot_health if b["zone"] == "WATCH"),
+                "rotate": sum(1 for b in bot_health if b["zone"] == "ROTATE"),
+                "swaps_needed": len(swaps),
+            },
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
